@@ -1,0 +1,127 @@
+.TH UNBOUND-DASHBOARD 1 "2026-07-31" "unbound-dashboard" "Unbound DNS Dashboard"
+.SH NAME
+unbound-dashboard \- lightweight real-time visualization dashboard for Unbound DNS
+.SH SYNOPSIS
+.B unbound-dashboard
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B unbound-dashboard
+is a lightweight, single-binary DNS visualization dashboard written in Go
+with SQLite storage. It reads DNS query data from Unbound via DNSTap socket
+or verbose log file, and serves a real-time web dashboard with Top-N query
+and blocked domain statistics.
+.PP
+The dashboard listens on port 9153 by default and provides both an HTML
+dashboard and a JSON API endpoint for monitoring integration.
+.SH DATA SOURCE MODES
+.B unbound-dashboard
+supports two mutually exclusive data source modes. Exactly one must be
+specified at startup.
+.SS DNSTap mode (recommended)
+Uses the DNSTap Frame Streams protocol over a Unix socket. Requires Unbound
+compiled with \fB\-\-enable\-dnstap\fR. Provides real-time streaming with
+better performance and structured data.
+.SS Log file mode
+Tails an Unbound verbose log file. Compatible with any Unbound installation
+without extra compile options. Requires \fBverbosity: 2\fR and
+\fBlog-queries: yes\fR in the Unbound configuration.
+.SH OPTIONS
+.TP
+.BI \-a " \fR,\fP " \-\-addr " ADDRESS"
+HTTP listen address. Default: \fB127.0.0.1\fR.
+.TP
+.BI \-p " \fR,\fP " \-\-port " PORT"
+HTTP listen port. Default: \fB9153\fR.
+.TP
+.BI \-d " \fR,\fP " \-\-data\-dir " DIR"
+Directory for SQLite database storage. Default: \fB/var/lib/unbound\fR.
+.TP
+.BI \-D " \fR,\fP " \-\-dnstap " PATH"
+DNSTap Unix socket path. Mutually exclusive with \fB\-l\fR.
+.TP
+.BI \-l " \fR,\fP " \-\-log\-file " PATH"
+Unbound verbose log file path. Mutually exclusive with \fB\-D\fR.
+.TP
+.BI \-t " \fR,\fP " \-\-ttl " DAYS"
+Data retention period in days. The dashboard automatically purges records
+older than this value every hour. Default: \fB90\fR. Maximum: 9999.
+.TP
+.BI \-S " \fR,\fP " \-\-size " MB"
+Maximum database file size in megabytes. When exceeded, the oldest records
+are purged. Default: \fB200\fR. Maximum: 9999.
+.TP
+.B \-V "\fR,\fP " \-\-version
+Print the version string and exit.
+.TP
+.B \-h "\fR,\fP " \-\-help
+Print usage information and exit.
+.SH HTTP ENDPOINTS
+Once running, the dashboard exposes three HTTP endpoints:
+.TP
+.B /
+HTML visualization dashboard with Top 10 queries and blocked domains.
+Auto-refreshes every 5 seconds.
+.TP
+.B /stats
+JSON statistics API. Returns total queries, blocked queries, uptime,
+top queried domains, and top blocked domains. Suitable for monitoring
+and scripting integration.
+.TP
+.B /debug
+Plain-text runtime debug information, including data source type,
+connection path, database location, and the last 5 ingested records.
+.SH EXAMPLES
+Start with DNSTap socket:
+.PP
+.RS
+.nf
+unbound-dashboard \-\-dnstap /var/lib/unbound/dnstap.sock
+.fi
+.RE
+.PP
+Start with log file, listen on all interfaces:
+.PP
+.RS
+.nf
+unbound-dashboard \-\-log\-file /var/log/unbound.log \-\-addr 0.0.0.0
+.fi
+.RE
+.PP
+Query the JSON API:
+.PP
+.RS
+.nf
+curl \-s http://localhost:9153/stats | jq
+.fi
+.RE
+.SH SYSTEMD SERVICE
+A systemd unit file is provided for production deployments. After
+installation via the .deb package, enable and start the service:
+.PP
+.RS
+.nf
+systemctl enable \-\-now unbound\-dashboard
+.fi
+.RE
+.PP
+Edit \fB/etc/systemd/system/unbound\-dashboard.service\fR to configure
+the data source and other options before starting.
+.SH FILES
+.TP
+.I /usr/local/bin/unbound\-dashboard
+The dashboard binary.
+.TP
+.I /var/lib/unbound/dashboard.db
+SQLite database (default location).
+.TP
+.I /etc/systemd/system/unbound\-dashboard.service
+Systemd service unit.
+.SH SEE ALSO
+.BR unbound (8),
+.BR unbound.conf (5)
+.PP
+GitHub repository:
+.UR https://github.com/LeisureLinux/unbound-dashboard
+.UE
+.SH AUTHORS
+.LeisureLinux

@@ -1,0 +1,15 @@
+#!/bin/bash
+set -e
+
+if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
+    # 停止服务
+    if systemctl is-active --quiet unbound-dashboard; then
+        systemctl stop unbound-dashboard
+    fi
+    if systemctl is-enabled --quiet unbound-dashboard; then
+        systemctl disable unbound-dashboard
+    fi
+fi
+
+#DEBHELPER#
+exit 0

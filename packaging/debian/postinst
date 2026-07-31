@@ -1,0 +1,26 @@
+#!/bin/bash
+set -e
+
+if [ "$1" = "configure" ]; then
+    # 确保数据目录存在
+    mkdir -p /var/lib/unbound
+    chmod 755 /var/lib/unbound
+
+    # 重新加载 systemd
+    systemctl daemon-reload
+
+    echo ""
+    echo "=== unbound-dashboard installed ==="
+    echo ""
+    echo "1. Edit the service file to set your data source:"
+    echo "   sudo systemctl edit unbound-dashboard"
+    echo ""
+    echo "2. Enable and start:"
+    echo "   sudo systemctl enable --now unbound-dashboard"
+    echo ""
+    echo "3. Open http://localhost:9153 in your browser"
+    echo ""
+fi
+
+#DEBHELPER#
+exit 0

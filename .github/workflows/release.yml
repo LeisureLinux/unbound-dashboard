@@ -1,0 +1,72 @@
+name: Release .deb packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goarch: amd64
+            deb_arch: amd64
+            cc: gcc
+            pkg_prefix: ""
+          - goarch: arm64
+            deb_arch: arm64
+            cc: aarch64-linux-gnu-gcc
+            pkg_prefix: "gcc-aarch64-linux-gnu"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Install cross-compiler (arm64)
+        if: matrix.goarch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.pkg_prefix }}
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+          echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          echo "Building version: $TAG"
+
+      - name: Build binary
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 1
+          CC: ${{ matrix.cc }}
+        run: |
+          go build -ldflags="-s -w" -o bins/unbound-dashboard ./cmd/
+          file bins/unbound-dashboard
+
+      - name: Build .deb package
+        run: |
+          bash packaging/build-deb.sh \
+            "${{ steps.version.outputs.version }}" \
+            "${{ matrix.deb_arch }}" \
+            "bins/unbound-dashboard"
+
+      - name: Upload .deb to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DEB_FILE="unbound-dashboard_${{ steps.version.outputs.version }}_${{ matrix.deb_arch }}.deb"
+          gh release upload "${{ steps.version.outputs.tag }}" "$DEB_FILE" --clobber
+          echo "✅ Uploaded $DEB_FILE"

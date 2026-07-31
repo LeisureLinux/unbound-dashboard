@@ -1,0 +1,19 @@
+Package: unbound-dashboard
+Version: ${VERSION}
+Section: net
+Priority: optional
+Architecture: ${ARCH}
+Depends: libc6
+Maintainer: LeisureLinux <albertxu@freelamp.com>
+Description: Lightweight Unbound DNS real-time visualization dashboard
+ A single-binary DNS dashboard written in Go with SQLite storage.
+ Reads DNS query data from Unbound via DNSTap socket or verbose log
+ file, and serves a real-time web dashboard with Top-N query and
+ blocked domain statistics.
+ .
+ Features:
+  - DNSTap and verbose-log dual data source modes
+  - REST API: /stats (JSON), /debug (Text)
+  - HTML dashboard with auto-refresh
+  - SQLite storage with automatic data retention
+Homepage: https://github.com/LeisureLinux/unbound-dashboard

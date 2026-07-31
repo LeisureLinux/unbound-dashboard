@@ -1,0 +1,25 @@
+[Unit]
+Description=Unbound DNS Dashboard
+Documentation=https://github.com/LeisureLinux/unbound-dashboard/
+After=network.target unbound.service
+Wants=unbound.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/unbound-dashboard \
+    --dnstap /var/lib/unbound/dnstap.sock \
+    --data-dir /var/lib/unbound
+Restart=always
+RestartSec=5
+User=root
+Group=root
+
+# 安全加固
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/unbound
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
