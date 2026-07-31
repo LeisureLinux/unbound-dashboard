@@ -112,3 +112,82 @@ jobs:
           done
           
           echo "✅ Release complete!"
+
+  # ===== 发布到自建 APT 仓库（gh-pages 分支）=====
+  publish-apt:
+    needs: build-deb
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: debs
+          merge-multiple: true
+
+      - name: List downloaded files
+        run: ls -la debs/
+
+      - name: Build and publish apt repo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          
+          # 配置 git
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          WORK_DIR=$(mktemp -d)
+          cd "$WORK_DIR"
+          
+          # 尝试 clone gh-pages 分支
+          if git clone --branch gh-pages --depth 1 "$REPO_URL" . 2>/dev/null; then
+            echo "✅ 已有 gh-pages 分支"
+          else
+            echo "📦 初始化 gh-pages 分支"
+            git init
+            git checkout -b gh-pages
+            git remote add origin "$REPO_URL"
+            echo "# APT Repository" > README.md
+            echo "This branch serves as an APT repository for unbound-dashboard." >> README.md
+            git add README.md
+            git commit -m "Initial apt repo"
+            git push -u origin gh-pages
+          fi
+          
+          # 复制 .deb 文件到仓库根目录
+          cp "$GITHUB_WORKSPACE/debs/"*.deb .
+          echo "📦 当前 .deb 文件:"
+          ls -la *.deb
+          
+          # 安装 apt-utils（提供 apt-ftparchive）
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq apt-utils
+          
+          # 生成 Packages 索引
+          apt-ftparchive packages . > Packages
+          gzip -k -f Packages
+          
+          # 生成 Release 元数据
+          apt-ftparchive release . > Release
+          
+          # 可选：GPG 签名（如果配置了 APT_GPG_KEY secret）
+          if [ -n "${{ secrets.APT_GPG_KEY }}" ]; then
+            echo "🔑 导入 GPG key 并签名..."
+            echo "${{ secrets.APT_GPG_KEY }}" | gpg --batch --import
+            gpg -abs -o InRelease Release
+            gpg -abs -o Release.gpg Release
+            echo "✅ Release 已签名"
+          else
+            echo "ℹ️ 未配置 APT_GPG_KEY，跳过签名（用户需用 [trusted=yes]）"
+          fi
+          
+          # 提交并推送
+          git add -A
+          git commit -m "apt: update for ${{ github.ref_name }}" || {
+            echo "⚠️ 无变更，跳过推送"
+            exit 0
+          }
+          git push origin gh-pages
+          echo "✅ APT 仓库已更新！"

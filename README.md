@@ -11,7 +11,26 @@
 
 ---
 
-## 快速开始
+## 安装
+
+### 方式一：通过 APT 安装（推荐）
+
+添加 APT 源（一次性配置）：
+
+```bash
+# 添加 APT 源
+echo "deb [trusted=yes] https://leisurelinux.github.io/unbound-dashboard ./" | \
+  sudo tee /etc/apt/sources.list.d/unbound-dashboard.list
+
+# 更新并安装
+sudo apt update
+sudo apt install unbound-dashboard
+```
+
+安装后，程序位于 `/usr/local/bin/unbound-dashboard`，man 手册和 systemd 服务已就绪。
+
+### 方式二：从源码编译
+
 
 ```bash
 # 1. 克隆
