@@ -1,6 +1,6 @@
 # Unbound DNS Dashboard
 
-轻量级 **Unbound DNS 实时可视化看板**，用 Go 编写，SQLite 存储。支持从 Unbound verbose-log 或 DNSTap socket 读取数据，提供 Top10 查询域名 / 拦截域名的仪表盘界面。
+轻量级 **[Unbound](https://github.com/NLnetLabs/unbound) DNS 实时可视化看板**，用 Go 编写，SQLite 存储。支持从 Unbound verbose-log 或 DNSTap socket 读取数据，提供 Top10 查询域名 / 拦截域名的仪表盘界面。
 
 ```
 端口 : 9153
