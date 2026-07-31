@@ -173,6 +173,64 @@ scp bins/unbound-dashboard-arm64 user@raspberry-pi:/usr/local/bin/unbound-dashbo
 
 ---
 
+## API 接口
+
+启动后提供三个 HTTP 端点（端口默认 9153）：
+
+| 路径 | 格式 | 说明 |
+|------|------|------|
+| `/` | HTML | 可视化仪表盘，5 秒自动刷新 |
+| `/stats` | JSON | 统计数据，适合脚本/监控集成 |
+| `/debug` | Text | 运行时调试信息（数据源、数据库路径、最近 5 条记录） |
+
+### /stats 示例
+
+```bash
+curl -s http://localhost:9153/stats | jq
+```
+
+返回：
+
+```json
+{
+  "total_queries": 12345,
+  "blocked_queries": 678,
+  "uptime": "3h25m10s",
+  "top_queries": [
+    {"Name": "example.com", "Value": 523},
+    {"Name": "dns.google", "Value": 412}
+  ],
+  "top_blocked": [
+    {"Name": "ads.tracker.com", "Value": 89},
+    {"Name": "telemetry.evil.com", "Value": 67}
+  ]
+}
+```
+
+### /debug 示例
+
+```bash
+curl http://localhost:9153/debug
+```
+
+返回纯文本：
+
+```
+== Unbound Dashboard Debug Info ==
+
+Data Source Type : DNSTap Socket
+Connection Path  : /var/lib/unbound/dnstap.sock
+Storage Location : /var/lib/unbound/dashboard.db
+
+--- Statistics ---
+Total Queries    : 12345
+Blocked Queries  : 678
+
+--- Last 5 Records Ingested ---
+  [NOERROR] example.com (A) -> 93.184.216.34
+  [NXDOMAIN] blocked.ads (A) -> NXDOMAIN
+```
+
 ## Systemd 服务（推荐）
 
 ### DNSTap 模式
