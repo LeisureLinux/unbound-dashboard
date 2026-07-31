@@ -63,10 +63,49 @@ jobs:
             "${{ matrix.deb_arch }}" \
             "bins/unbound-dashboard"
 
-      - name: Upload .deb to release
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.deb_arch }}
+          path: unbound-dashboard_${{ steps.version.outputs.version }}_${{ matrix.deb_arch }}.deb
+
+  release:
+    needs: build-deb
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create Release and Upload
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          DEB_FILE="unbound-dashboard_${{ steps.version.outputs.version }}_${{ matrix.deb_arch }}.deb"
-          gh release upload "${{ steps.version.outputs.tag }}" "$DEB_FILE" --clobber
-          echo "✅ Uploaded $DEB_FILE"
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          
+          # 创建 release（如果不存在）
+          if ! gh release view "$TAG" &>/dev/null; then
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes "Unbound DNS Dashboard $VERSION
+          
+          - DNSTap and verbose-log dual data source modes
+          - SQLite storage, single binary deployment
+          - REST API: /stats (JSON), /debug (Text)
+          - HTML dashboard with auto-refresh
+          - amd64 and arm64 .deb packages"
+          fi
+          
+          # 上传所有 .deb 文件
+          for deb in artifacts/*.deb; do
+            echo "Uploading $deb..."
+            gh release upload "$TAG" "$deb" --clobber
+          done
+          
+          echo "✅ Release complete!"
