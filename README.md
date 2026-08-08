@@ -13,14 +13,15 @@
 
 ## 安装
 
-### 方式一：通过 APT 安装（推荐）
+### 方式一：通过 Freelamp APT 仓库安装（推荐）
 
-添加 APT 源（一次性配置）：
+添加 APT 源（一次性配置，含 GPG 签名公钥）：
 
 ```bash
 # 添加 APT 源
-echo "deb [trusted=yes] https://leisurelinux.github.io/unbound-dashboard ./" | \
-  sudo tee /etc/apt/sources.list.d/unbound-dashboard.list
+curl -fsSL https://repo.freelamp.com/apt.key | sudo gpg --dearmor -o /usr/share/keyrings/freelamp.gpg
+echo "deb [signed-by=/usr/share/keyrings/freelamp.gpg] https://repo.freelamp.com bookworm main" | \
+  sudo tee /etc/apt/sources.list.d/freelamp.sources
 
 # 更新并安装
 sudo apt update

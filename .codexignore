@@ -1,0 +1,4 @@
+# unbound-dashboard: ignore git history and compiled binaries
+.git/
+bins/
+*.log
