@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -164,7 +165,19 @@ func main() {
 	}()
 
 	fmt.Printf("✅ Dashboard starting at http://%s\n", addr)
-	if err := server.ListenAndServe(); err != http.ErrServerClosed {
+	// Go 1.24 and later open TCP listeners as MPTCP sockets by default.
+	// CVE-2026-98432 is a kernel use-after-free in the IPv4 TCP request
+	// path, and the only demonstrated remote code execution against it
+	// needs an MPTCP listener. Opting out here keeps this listener plain
+	// TCP, which closes that path. It does not repair the kernel: the
+	// kernel still has to be updated.
+	lc := net.ListenConfig{}
+	lc.SetMultipathTCP(false)
+	ln, err := lc.Listen(context.Background(), "tcp", addr)
+	if err != nil {
+		log.Fatalf("Listen error: %v\n", err)
+	}
+	if err := server.Serve(ln); err != http.ErrServerClosed {
 		log.Fatalf("Listen error: %v", err)
 	}
 	<-idleConnsClosed
