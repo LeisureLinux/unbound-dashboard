@@ -19,7 +19,7 @@ import (
 	"unbound-dashboard/ingestor"
 )
 
-const Version = "v0.2.42.20260731090827"
+const Version = "v0.2.45"
 
 func main() {
 	// 预处理参数：将 --xxx 转换为 -x（双横杠单词 → 单横杠字母）
