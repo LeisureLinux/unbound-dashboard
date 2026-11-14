@@ -1,428 +1,357 @@
+// Package ingestor: DNSTap Frame Streams (fstrm) server.
+//
+// Hardening borrowed from DNS-collector's global.framestream and
+// collector_dnstap settings: bounded control/data frame lengths, handshake
+// and read deadlines, content-type validation, concurrent connections, no
+// unlink of arbitrary paths, and a least-privilege socket mode.
 package ingestor
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"os"
+	"os/user"
+	"path/filepath"
+	"strconv"
+	"sync"
 	"time"
 
 	"unbound-dashboard/core"
-	"unbound-dashboard/database"
 )
 
 const (
-	CONTROL_ACCEPT = 0x01
-	CONTROL_START  = 0x02
-	CONTROL_STOP   = 0x03
-	CONTROL_READY  = 0x04
-	CONTROL_FINISH = 0x05
+	controlAccept = 0x01
+	controlStart  = 0x02
+	controlStop   = 0x03
+	controlReady  = 0x04
+	controlFinish = 0x05
 
-	CONTROL_FIELD_CONTENT_TYPE = 0x01
-	CONTENT_TYPE_DNSTAP        = "protobuf:dnstap.Dnstap"
+	controlFieldContentType = 0x01
+	contentTypeDNSTap       = "protobuf:dnstap.Dnstap"
 
-	DNSTAP_FIELD_MESSAGE = 0x0e
-
-	MSG_FIELD_QUERY_MESSAGE    = 0x0a // field 10
-	MSG_FIELD_RESPONSE_MESSAGE = 0x0e // field 14
+	controlFrameMaxLen = 4064  // DNS-collector default
+	dataFrameMaxLen    = 65536 // DNS-collector default
+	handshakeTimeout   = 5 * time.Second
+	readTimeout        = 30 * time.Second
 )
 
+// DnstapReader listens on a unix socket for Unbound's dnstap stream.
 type DnstapReader struct {
 	socketPath string
+	mode       os.FileMode
+	group      string
+	edge       *Edge
+	merger     *Merger
+	listener   net.Listener
+	mu         sync.Mutex
+	closed     bool
+	conns      map[net.Conn]struct{}
+	wg         sync.WaitGroup
 }
 
-func NewDnstapReader(p string) *DnstapReader {
-	return &DnstapReader{socketPath: p}
+func NewDnstapReader(path string, cfg *core.Config, edge *Edge, merger *Merger) *DnstapReader {
+	return &DnstapReader{
+		socketPath: path,
+		mode:       cfg.SocketMode,
+		group:      cfg.SocketGroup,
+		edge:       edge,
+		merger:     merger,
+		conns:      make(map[net.Conn]struct{}),
+	}
 }
 
 func (d *DnstapReader) GetPath() string { return d.socketPath }
 
-func (d *DnstapReader) Start(db *database.Database) error {
-	if _, err := os.Stat(d.socketPath); err == nil {
-		os.Remove(d.socketPath)
+// Start creates the socket and serves connections until Close is called.
+// Unlike the old implementation it never returns nil on a STOP frame — Unbound
+// restarts routinely, and a silent exit left the dashboard serving stale data.
+func (d *DnstapReader) Start(sink core.Sink) error {
+	if err := d.prepareSocketPath(); err != nil {
+		return err
 	}
-
-	listener, err := net.Listen("unix", d.socketPath)
+	ln, err := net.Listen("unix", d.socketPath)
 	if err != nil {
-		return fmt.Errorf("创建 socket 失败: %w", err)
+		return fmt.Errorf("创建 DNSTap socket 失败: %w", err)
 	}
-	defer listener.Close()
+	d.mu.Lock()
+	d.listener = ln
+	d.mu.Unlock()
 
-	os.Chmod(d.socketPath, 0777)
-
-	fmt.Printf("✅ DNSTap socket 已创建: %s\n", d.socketPath)
+	if err := d.applySocketPerms(); err != nil {
+		log.Printf("⚠️  socket 权限设置失败: %v", err)
+	}
+	fmt.Printf("✅ DNSTap socket 已创建: %s (mode %04o)\n", d.socketPath, d.mode)
 	fmt.Println("👂 等待 Unbound 连接...")
 
 	for {
-		conn, err := listener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
+			d.mu.Lock()
+			closed := d.closed
+			d.mu.Unlock()
+			if closed {
+				return nil
+			}
 			return fmt.Errorf("接受连接失败: %w", err)
 		}
-		fmt.Println("✅ Unbound 已连接")
-
-		err = d.handleConnection(conn, db)
-		conn.Close()
-		if err != nil {
-			fmt.Printf("⚠️  连接断开: %v\n", err)
-			fmt.Println("👂 等待 Unbound 重新连接...")
+		d.mu.Lock()
+		if d.closed {
+			d.mu.Unlock()
+			_ = conn.Close()
 			continue
 		}
-		return nil
+		d.conns[conn] = struct{}{}
+		d.mu.Unlock()
+		core.Metrics.Connects.Add(1)
+		d.wg.Add(1)
+		// Concurrent connections: a slow/restarting peer must not block others.
+		go func() {
+			defer d.wg.Done()
+			defer core.Metrics.Disconnects.Add(1)
+			defer func() {
+				d.mu.Lock()
+				delete(d.conns, conn)
+				d.mu.Unlock()
+			}()
+			if err := d.handleConnection(conn); err != nil && !errors.Is(err, io.EOF) {
+				log.Printf("⚠️  DNSTap 连接结束: %v", err)
+			}
+		}()
 	}
 }
 
-func (d *DnstapReader) handleConnection(conn net.Conn, db *database.Database) error {
-	fmt.Println("🤝 开始 Frame Streams 双向握手...")
+// prepareSocketPath refuses to unlink anything that is not a socket. This
+// avoids the old os.Remove(path) deleting a regular file at a user-supplied
+// path (and a symlink-based attack).
+func (d *DnstapReader) prepareSocketPath() error {
+	dir := filepath.Dir(d.socketPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("创建 socket 目录失败: %w", err)
+	}
+	fi, err := os.Lstat(d.socketPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("检查 socket 路径失败: %w", err)
+	}
+	if fi.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("拒绝删除非 socket 文件: %s (mode %s)", d.socketPath, fi.Mode())
+	}
+	// Even for a socket, verify it is stale before unlinking: dial it first.
+	c, err := net.DialTimeout("unix", d.socketPath, 200*time.Millisecond)
+	if err == nil {
+		_ = c.Close()
+		return fmt.Errorf("%s 上已有活动的 DNSTap 服务，拒绝抢占", d.socketPath)
+	}
+	if err := os.Remove(d.socketPath); err != nil {
+		return fmt.Errorf("删除陈旧 socket 失败: %w", err)
+	}
+	return nil
+}
 
-	ctype, _, err := readHandshakeFrame(conn)
+func (d *DnstapReader) applySocketPerms() error {
+	if err := os.Chmod(d.socketPath, d.mode); err != nil {
+		return err
+	}
+	if d.group == "" {
+		return nil
+	}
+	grp, err := user.LookupGroup(d.group)
+	if err != nil {
+		return fmt.Errorf("找不到组 %q: %w", d.group, err)
+	}
+	gid, err := strconv.Atoi(grp.Gid)
+	if err != nil {
+		return err
+	}
+	if err := os.Chown(d.socketPath, -1, gid); err != nil {
+		return fmt.Errorf("chown socket 到组 %q 失败: %w", d.group, err)
+	}
+	return nil
+}
+
+func (d *DnstapReader) Close() error {
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		return nil
+	}
+	d.closed = true
+	ln := d.listener
+	d.mu.Unlock()
+	if ln != nil {
+		_ = ln.Close()
+	}
+	// Unblock in-flight read deadlines so shutdown does not wait 30s.
+	d.mu.Lock()
+	for c := range d.conns {
+		_ = c.Close()
+	}
+	d.mu.Unlock()
+	d.wg.Wait()
+	return nil
+}
+
+func (d *DnstapReader) handleConnection(conn net.Conn) error {
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		return err
+	}
+
+	ctype, contentTypes, err := readHandshakeFrame(conn)
 	if err != nil {
 		return fmt.Errorf("读取 READY 失败: %w", err)
 	}
-	if ctype != CONTROL_READY {
-		return fmt.Errorf("期望 READY(0x%02x)，收到 0x%02x", CONTROL_READY, ctype)
+	if ctype != controlReady {
+		return fmt.Errorf("期望 READY(0x%02x)，收到 0x%02x", controlReady, ctype)
 	}
-
-	if err := sendHandshakeFrame(conn, CONTROL_ACCEPT, []string{CONTENT_TYPE_DNSTAP}); err != nil {
+	if !hasContentType(contentTypes, contentTypeDNSTap) {
+		return fmt.Errorf("不支持的 content-type %v", contentTypes)
+	}
+	if err := sendHandshakeFrame(conn, controlAccept, []string{contentTypeDNSTap}); err != nil {
 		return fmt.Errorf("发送 ACCEPT 失败: %w", err)
 	}
-
 	ctype, _, err = readHandshakeFrame(conn)
 	if err != nil {
 		return fmt.Errorf("读取 START 失败: %w", err)
 	}
-	if ctype != CONTROL_START {
-		return fmt.Errorf("期望 START(0x%02x)，收到 0x%02x", CONTROL_START, ctype)
+	if ctype != controlStart {
+		return fmt.Errorf("期望 START(0x%02x)，收到 0x%02x", controlStart, ctype)
 	}
-	fmt.Println("📥 收到 START，开始接收数据帧...")
-
-	count := 0
+	_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
+	log.Printf("📥 DNSTap 握手完成，开始接收数据帧")
 
 	for {
 		var frameLen uint32
 		if err := binary.Read(conn, binary.BigEndian, &frameLen); err != nil {
-			return fmt.Errorf("读取帧长度失败: %w", err)
+			return err
 		}
-
 		if frameLen == 0 {
-			ctype, _, err := readCtrlBody(conn)
+			ctrlType, _, err := readCtrlBody(conn)
 			if err != nil {
 				return fmt.Errorf("读取控制帧失败: %w", err)
 			}
-			if ctype == CONTROL_STOP {
-				fmt.Println("🛑 收到 STOP 控制帧")
-				if err := sendHandshakeFrame(conn, CONTROL_FINISH, nil); err != nil {
-					fmt.Printf("⚠️  发送 FINISH 失败: %v\n", err)
-				}
-				return nil
+			if ctrlType == controlStop {
+				_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
+				return sendHandshakeFrame(conn, controlFinish, nil)
 			}
+			_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
 			continue
 		}
-
+		if frameLen > dataFrameMaxLen {
+			core.Metrics.FramesMalformed.Add(1)
+			return fmt.Errorf("数据帧长度 %d 超过上限 %d", frameLen, dataFrameMaxLen)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
 		frame := make([]byte, frameLen)
-		if _, err := readFull(conn, frame); err != nil {
+		if _, err := io.ReadFull(conn, frame); err != nil {
 			return fmt.Errorf("读取数据帧失败: %w", err)
 		}
-		rec := parseDnstapFrame(frame)
-		if rec != nil {
-			err := db.InsertRecord(*rec)
-			if err != nil {
-				fmt.Printf("❌ 插入数据库失败: %v\n", err)
-			} else {
-				count++
-			}
-		}
+		core.Metrics.FramesReceived.Add(1)
+		d.processFrame(frame)
 	}
 }
 
-func sendHandshakeFrame(conn net.Conn, frameType uint32, contentTypes []string) error {
-	var frame []byte
-	b := make([]byte, 4)
-
-	binary.BigEndian.PutUint32(b, 0)
-	frame = append(frame, b...)
-
-	var ctrlData []byte
-	binary.BigEndian.PutUint32(b, frameType)
-	ctrlData = append(ctrlData, b...)
-
-	for _, ct := range contentTypes {
-		binary.BigEndian.PutUint32(b, CONTROL_FIELD_CONTENT_TYPE)
-		ctrlData = append(ctrlData, b...)
-		binary.BigEndian.PutUint32(b, uint32(len(ct)))
-		ctrlData = append(ctrlData, b...)
-		ctrlData = append(ctrlData, []byte(ct)...)
+func (d *DnstapReader) processFrame(frame []byte) {
+	decoded, err := DecodeDnstapFrame(frame)
+	if err != nil {
+		core.Metrics.FramesMalformed.Add(1)
+		return
 	}
+	rec, ok := d.edge.Prepare(decoded.Record)
+	if !ok {
+		return
+	}
+	decoded.Record = rec
+	// The frame was already normalized/filtered/anonymized by Prepare above;
+	// the merged record inherits those fields. Do not Prepare twice (it would
+	// hash the IP a second time).
+	if merged, complete := d.merger.Add(decoded); complete {
+		d.edge.Emit(merged)
+	}
+}
 
-	binary.BigEndian.PutUint32(b, uint32(len(ctrlData)))
+// FlushTimeouts emits queries whose response never arrived.
+func (d *DnstapReader) FlushTimeouts() {
+	for _, rec := range d.merger.Expired() {
+		d.edge.Emit(rec)
+	}
+}
+
+func hasContentType(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+func sendHandshakeFrame(w io.Writer, frameType uint32, contentTypes []string) error {
+	var ctrl []byte
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, frameType)
+	ctrl = append(ctrl, b...)
+	for _, ct := range contentTypes {
+		binary.BigEndian.PutUint32(b, controlFieldContentType)
+		ctrl = append(ctrl, b...)
+		binary.BigEndian.PutUint32(b, uint32(len(ct)))
+		ctrl = append(ctrl, b...)
+		ctrl = append(ctrl, []byte(ct)...)
+	}
+	frame := make([]byte, 4, 8+len(ctrl)) // escape=0
+	binary.BigEndian.PutUint32(frame[0:4], 0)
+	binary.BigEndian.PutUint32(b, uint32(len(ctrl)))
 	frame = append(frame, b...)
-	frame = append(frame, ctrlData...)
-
-	_, err := conn.Write(frame)
+	frame = append(frame, ctrl...)
+	_, err := w.Write(frame)
 	return err
 }
 
-func readHandshakeFrame(conn net.Conn) (uint32, []string, error) {
+func readHandshakeFrame(r io.Reader) (uint32, []string, error) {
 	var escape uint32
-	if err := binary.Read(conn, binary.BigEndian, &escape); err != nil {
+	if err := binary.Read(r, binary.BigEndian, &escape); err != nil {
 		return 0, nil, fmt.Errorf("读取 escape 失败: %w", err)
 	}
 	if escape != 0 {
 		return 0, nil, fmt.Errorf("escape 不是 0: %d", escape)
 	}
-	return readCtrlBody(conn)
+	return readCtrlBody(r)
 }
 
-func readCtrlBody(conn net.Conn) (uint32, []string, error) {
+func readCtrlBody(r io.Reader) (uint32, []string, error) {
 	var ctrlLen uint32
-	if err := binary.Read(conn, binary.BigEndian, &ctrlLen); err != nil {
+	if err := binary.Read(r, binary.BigEndian, &ctrlLen); err != nil {
 		return 0, nil, fmt.Errorf("读取控制帧长度失败: %w", err)
 	}
-
-	if ctrlLen < 4 {
-		return 0, nil, fmt.Errorf("控制帧长度太短: %d", ctrlLen)
+	if ctrlLen < 4 || ctrlLen > controlFrameMaxLen {
+		return 0, nil, fmt.Errorf("控制帧长度 %d 越界 (4..%d)", ctrlLen, controlFrameMaxLen)
 	}
-
 	ctrlData := make([]byte, ctrlLen)
-	if _, err := readFull(conn, ctrlData); err != nil {
+	if _, err := io.ReadFull(r, ctrlData); err != nil {
 		return 0, nil, fmt.Errorf("读取控制帧数据失败: %w", err)
 	}
-
 	ctrlType := binary.BigEndian.Uint32(ctrlData[0:4])
-
 	var contentTypes []string
-	offset := 4
-	for offset+8 <= len(ctrlData) {
-		fieldType := binary.BigEndian.Uint32(ctrlData[offset : offset+4])
-		offset += 4
-		if fieldType != CONTROL_FIELD_CONTENT_TYPE {
+	off := 4
+	for off+8 <= len(ctrlData) {
+		fieldType := binary.BigEndian.Uint32(ctrlData[off : off+4])
+		off += 4
+		if fieldType != controlFieldContentType {
 			break
 		}
-		fieldLen := binary.BigEndian.Uint32(ctrlData[offset : offset+4])
-		offset += 4
-		if offset+int(fieldLen) > len(ctrlData) {
+		fieldLen := binary.BigEndian.Uint32(ctrlData[off : off+4])
+		off += 4
+		if uint64(off)+uint64(fieldLen) > uint64(len(ctrlData)) {
 			break
 		}
-		contentTypes = append(contentTypes, string(ctrlData[offset:offset+int(fieldLen)]))
-		offset += int(fieldLen)
+		contentTypes = append(contentTypes, string(ctrlData[off:off+int(fieldLen)]))
+		off += int(fieldLen)
 	}
-
 	return ctrlType, contentTypes, nil
-}
-
-func parseDnstapFrame(data []byte) *core.QueryRecord {
-	msgBytes := getProtobufBytes(data, DNSTAP_FIELD_MESSAGE)
-	if msgBytes == nil {
-		return nil
-	}
-
-	var dnsPayload []byte
-	var isResponse bool
-
-	dnsPayload = getProtobufBytes(msgBytes, MSG_FIELD_RESPONSE_MESSAGE)
-	if dnsPayload != nil {
-		isResponse = true
-	} else {
-		dnsPayload = getProtobufBytes(msgBytes, MSG_FIELD_QUERY_MESSAGE)
-		if dnsPayload != nil {
-			isResponse = false
-		}
-	}
-
-	if dnsPayload == nil {
-		return nil
-	}
-
-	domain, qtype, rcode := parseDNSPacket(dnsPayload, isResponse)
-	if domain == "" {
-		return nil
-	}
-
-	rec := &core.QueryRecord{
-		Domain:    domain,
-		QType:     qtype,
-		RCode:     rcode,
-		Response:  "dnstap",
-		Timestamp: float64(time.Now().Unix()),
-	}
-
-	if rcode != "" && rcode != "NOERROR" && rcode != "SERVFAIL" {
-		rec.Blocked = true
-		rec.BlockReason = rcode
-	}
-
-	return rec
-}
-
-func parseDNSPacket(data []byte, isResponse bool) (domain string, qtype string, rcode string) {
-	if len(data) < 12 {
-		return "", "", ""
-	}
-
-	rcodeInt := int(data[3] & 0x0F)
-	rcode = rcodeToName(rcodeInt)
-
-	qdcount := int(binary.BigEndian.Uint16(data[4:6]))
-	if qdcount == 0 {
-		return "", "", rcode
-	}
-
-	offset := 12
-	domain, offset = decodeDNSName(data, offset)
-
-	if offset+2 <= len(data) {
-		qtypeInt := binary.BigEndian.Uint16(data[offset : offset+2])
-		qtype = qtypeToName(qtypeInt)
-	}
-
-	return domain, qtype, rcode
-}
-
-func decodeDNSName(data []byte, offset int) (string, int) {
-	var parts []string
-	jumped := false
-	returnOffset := offset
-	for offset < len(data) {
-		length := int(data[offset])
-		if length == 0 {
-			offset++
-			break
-		}
-		if length&0xC0 == 0xC0 {
-			if offset+1 >= len(data) {
-				break
-			}
-			ptr := int(binary.BigEndian.Uint16(data[offset:offset+2]) & 0x3FFF)
-			if !jumped {
-				returnOffset = offset + 2
-			}
-			offset = ptr
-			jumped = true
-			continue
-		}
-		offset++
-		if offset+length > len(data) {
-			break
-		}
-		parts = append(parts, string(data[offset:offset+length]))
-		offset += length
-	}
-	if jumped {
-		return joinParts(parts), returnOffset
-	}
-	return joinParts(parts), offset
-}
-
-func joinParts(parts []string) string {
-	result := ""
-	for i, p := range parts {
-		if i > 0 {
-			result += "."
-		}
-		result += p
-	}
-	return result
-}
-
-func getProtobufBytes(data []byte, targetField int) []byte {
-	offset := 0
-	for offset < len(data) {
-		tag, n := decodeVarint(data[offset:])
-		if n == 0 {
-			return nil
-		}
-		offset += n
-		fieldNum := int(tag >> 3)
-		wireType := int(tag & 0x07)
-		switch wireType {
-		case 0:
-			_, n := decodeVarint(data[offset:])
-			if n == 0 {
-				return nil
-			}
-			offset += n
-		case 2:
-			length, n := decodeVarint(data[offset:])
-			if n == 0 {
-				return nil
-			}
-			offset += n
-			if fieldNum == targetField {
-				if offset+int(length) > len(data) {
-					return nil
-				}
-				return data[offset : offset+int(length)]
-			}
-			offset += int(length)
-		case 5:
-			if fieldNum == targetField {
-				if offset+4 > len(data) {
-					return nil
-				}
-				return data[offset : offset+4]
-			}
-			offset += 4
-		case 1:
-			if fieldNum == targetField {
-				if offset+8 > len(data) {
-					return nil
-				}
-				return data[offset : offset+8]
-			}
-			offset += 8
-		default:
-			return nil
-		}
-	}
-	return nil
-}
-
-func decodeVarint(data []byte) (uint64, int) {
-	var val uint64
-	var shift uint
-	for i, b := range data {
-		val |= uint64(b&0x7F) << shift
-		if b&0x80 == 0 {
-			return val, i + 1
-		}
-		shift += 7
-		if i > 9 {
-			return 0, 0
-		}
-	}
-	return 0, 0
-}
-
-func readFull(conn net.Conn, buf []byte) (int, error) {
-	total := 0
-	for total < len(buf) {
-		n, err := conn.Read(buf[total:])
-		if err != nil {
-			return total, err
-		}
-		total += n
-	}
-	return total, nil
-}
-
-func qtypeToName(qtype uint16) string {
-	names := map[uint16]string{
-		1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR",
-		15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV", 255: "ANY",
-		65: "HTTPS", 257: "CAA",
-	}
-	if name, ok := names[qtype]; ok {
-		return name
-	}
-	return fmt.Sprintf("TYPE%d", qtype)
-}
-
-func rcodeToName(rcode int) string {
-	names := map[int]string{
-		0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN",
-		4: "NOTIMP", 5: "REFUSED",
-	}
-	if name, ok := names[rcode]; ok {
-		return name
-	}
-	return fmt.Sprintf("RCODE%d", rcode)
 }

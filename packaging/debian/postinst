@@ -2,11 +2,23 @@
 set -e
 
 if [ "$1" = "configure" ]; then
-    # 确保数据目录存在
-    mkdir -p /var/lib/unbound
-    chmod 755 /var/lib/unbound
+    # 专用系统用户（不再以 root 运行）
+    if ! getent passwd unbound-dashboard >/dev/null; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin \
+            --gid unbound unbound-dashboard 2>/dev/null || \
+        useradd --system --no-create-home --shell /usr/sbin/nologin unbound-dashboard
+    fi
 
-    # 重新加载 systemd
+    # 数据目录：服务需要写 SQLite，Unbound 需要能连 socket
+    mkdir -p /var/lib/unbound
+    chmod 775 /var/lib/unbound
+    chown unbound-dashboard:unbound /var/lib/unbound 2>/dev/null || true
+    # 已有的 dashboard.db 也要能写
+    if [ -f /var/lib/unbound/dashboard.db ]; then
+        chown unbound-dashboard:unbound /var/lib/unbound/dashboard.db 2>/dev/null || true
+        chmod 660 /var/lib/unbound/dashboard.db 2>/dev/null || true
+    fi
+
     systemctl daemon-reload
 
     echo ""
@@ -19,6 +31,7 @@ if [ "$1" = "configure" ]; then
     echo "   sudo systemctl enable --now unbound-dashboard"
     echo ""
     echo "3. Open http://localhost:9153 in your browser"
+    echo "   Metrics: http://localhost:9153/metrics"
     echo ""
 fi
 

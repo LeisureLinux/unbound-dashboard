@@ -1,41 +1,32 @@
 #!/bin/bash
-# 自动更新版本号并编译
+# Build amd64 + arm64 binaries. Version comes from the git tag; no source
+# file is modified (the old script sed-ed a const in cmd/main.go).
+#
+# Usage: ./build.sh [version]
 
-# 读取当前版本号
-VERSION=$(grep 'const Version' cmd/main.go | sed 's/.*"\(.*\)".*/\1/')
-echo "当前版本: $VERSION"
+set -euo pipefail
 
-# 解析版本号 x.y.z.timestamp
-IFS='.' read -r MAJOR MINOR PATCH TIMESTAMP <<< "$VERSION"
+cd "$(dirname "$0")"
+VERSION="${1:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
+echo "版本: $VERSION"
 
-# 更新 patch 版本
-NEW_PATCH=$((PATCH + 1))
+mkdir -p bins
 
-# 生成新的时间戳
-NEW_TIMESTAMP=$(date +%Y%m%d%H%M%S)
+build() {
+    local goarch="$1" cc="$2" out="$3"
+    echo "正在编译 $goarch → $out ..."
+    GOOS=linux GOARCH="$goarch" CGO_ENABLED=1 CC="$cc" \
+        go build -ldflags="-s -w -X main.Version=$VERSION" -o "$out" ./cmd/
+    file "$out"
+    sha256sum "$out"
+}
 
-# 新版本号
-NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}.${NEW_TIMESTAMP}"
-echo "新版本: $NEW_VERSION"
-
-# 更新 main.go 中的版本号
-sed -i "s/const Version = \".*\"/const Version = \"$NEW_VERSION\"/" cmd/main.go
-
-# 清理缓存
-rm -rf /tmp/.gocache bins/unbound-dashboard-arm64
-
-# 编译 ARM64 版本
-echo "正在编译 ARM64 版本..."
-GOOS=linux GOARCH=arm64 CGO_ENABLED=1 \
-  CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ \
-  GOCACHE=/tmp/.gocache \
-  go build -ldflags="-s -w" -o bins/unbound-dashboard-arm64 ./cmd/
-
-if [ $? -eq 0 ]; then
-  echo "✅ 编译成功!"
-  ls -lh bins/unbound-dashboard-arm64
-  md5sum bins/unbound-dashboard-arm64
+build amd64 gcc bins/unbound-dashboard
+if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+    build arm64 aarch64-linux-gnu-gcc bins/unbound-dashboard-arm64
 else
-  echo "❌ 编译失败!"
-  exit 1
+    echo "⚠️  跳过 arm64：未安装 aarch64-linux-gnu-gcc"
+    echo "   sudo apt install gcc-aarch64-linux-gnu"
 fi
+
+echo "✅ 编译完成"

@@ -41,17 +41,9 @@ chmod 644 "$STAGING/usr/share/man/man1/unbound-dashboard.1.gz"
 cp "$SCRIPT_DIR/debian/systemd/unbound-dashboard.service" "$STAGING/etc/systemd/system/unbound-dashboard.service"
 chmod 644 "$STAGING/etc/systemd/system/unbound-dashboard.service"
 
-# 复制 copyright
-cat > "$STAGING/usr/share/doc/unbound-dashboard/copyright" << 'COPYEOF'
-Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: unbound-dashboard
-Upstream-Contact: LeisureLinux <albertxu@freelamp.com>
-Source: https://github.com/LeisureLinux/unbound-dashboard
-
-Files: *
-Copyright: 2026 LeisureLinux
-License: MIT
-COPYEOF
+# 复制 copyright（单一来源：packaging/debian/copyright）
+cp "$SCRIPT_DIR/debian/copyright" "$STAGING/usr/share/doc/unbound-dashboard/copyright"
+chmod 644 "$STAGING/usr/share/doc/unbound-dashboard/copyright"
 
 # 生成 control 文件（替换变量）
 sed -e "s/\${VERSION}/$VERSION/" \

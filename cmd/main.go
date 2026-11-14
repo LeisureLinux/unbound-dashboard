@@ -19,96 +19,45 @@ import (
 	"unbound-dashboard/ingestor"
 )
 
-const Version = "v0.2.45"
+// Version is overridden at build time with:
+//
+//	go build -ldflags "-X main.Version=v0.3.0" ./cmd/
+//
+// The fallback keeps `go run ./cmd/` working without ldflags.
+var Version = "dev"
 
 func main() {
-	// 预处理参数：将 --xxx 转换为 -x（双横杠单词 → 单横杠字母）
-	for i := 1; i < len(os.Args); i++ {
-		if len(os.Args[i]) > 2 && os.Args[i][:2] == "--" {
-			word := os.Args[i][2:] // 去掉 --
-			switch word {
-			case "version":
-				os.Args[i] = "-V"
-			case "help":
-				os.Args[i] = "-h"
-			case "addr":
-				os.Args[i] = "-a"
-			case "port":
-				os.Args[i] = "-p"
-			case "data-dir":
-				os.Args[i] = "-d"
-			case "dnstap":
-				os.Args[i] = "-D"
-			case "log-file":
-				os.Args[i] = "-l"
-			case "ttl":
-				os.Args[i] = "-t"
-			case "size":
-				os.Args[i] = "-S"
-			}
-		}
-	}
-
-	// 处理 -V 和 --version
-	for _, arg := range os.Args[1:] {
-		if arg == "-V" || arg == "--version" {
-			fmt.Println(Version)
-			os.Exit(0)
-		}
-	}
-
-	// 自定义帮助信息，增加 GitHub 地址
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Unbound Dashboard %s\n", Version)
-		fmt.Fprintf(os.Stderr, "GitHub: https://github.com/LeisureLinux/unbound-dashboard/\n\n")
-		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "Options:\n")
-		fmt.Fprintf(os.Stderr, "  -a, --addr string       HTTP listen address (default: \"127.0.0.1\")\n")
-		fmt.Fprintf(os.Stderr, "  -p, --port int          HTTP listen port (default: 9153)\n")
-		fmt.Fprintf(os.Stderr, "  -d, --data-dir string   Directory for database storage (default: \"/var/lib/unbound\")\n")
-		fmt.Fprintf(os.Stderr, "  -D, --dnstap string     DNSTap socket path\n")
-		fmt.Fprintf(os.Stderr, "  -l, --log-file string   DNS Server Log file path\n")
-		fmt.Fprintf(os.Stderr, "  -t, --ttl int           Days to keep logs in database storage (default: 90)\n")
-		fmt.Fprintf(os.Stderr, "  -S, --size int          Max database size in MB (default: 200, max: 9999)\n")
-		fmt.Fprintf(os.Stderr, "  -V, --version           Show version\n")
-		fmt.Fprintf(os.Stderr, "  -h, --help              Show help\n")
-	}
-
+	flag.Usage = usage
 	cfg := core.LoadConfig()
 
-	// 校验 ttl 范围
-	if cfg.CacheTTLDays < 1 {
-		cfg.CacheTTLDays = 90
-	} else if cfg.CacheTTLDays > 9999 {
-		cfg.CacheTTLDays = 9999
+	if cfg.VersionFlag {
+		fmt.Println(Version)
+		return
 	}
-
-	// 校验 MaxSizeMB 范围
-	if cfg.MaxSizeMB < 1 {
-		cfg.MaxSizeMB = 200
-	} else if cfg.MaxSizeMB > 9999 {
-		cfg.MaxSizeMB = 9999
-	}
-
-	// 没有参数时显示 help
 	if len(os.Args) == 1 {
-		flag.Usage()
-		os.Exit(0)
+		usage()
+		return
 	}
-
-	// 必须指定数据源
-	if cfg.DNSTapPath == "" && cfg.LogFilePath == "" {
-		fmt.Fprintf(os.Stderr, "❌ 错误: 必须指定数据源 (-D/--dnstap 或 -l/--log-file)\n\n")
-		flag.Usage()
+	if err := cfg.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ 配置错误: %v\n\n", err)
+		usage()
 		os.Exit(1)
+	}
+	codes, _ := core.ParseBlockRCodes(cfg.BlockRCodes) // already validated
+
+	if cfg.TestConfig {
+		fmt.Println("config OK!")
+		return
+	}
+	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+		log.Fatalf("❌ 创建数据目录 %s 失败: %v", cfg.DataDir, err)
 	}
 
 	fmt.Printf("🚀 Starting Unbound Dashboard %s...\n", Version)
 	fmt.Printf("   📂 Data Dir        : %s\n", cfg.DataDir)
 	fmt.Printf("   🎧 Listen Address  : %s:%d\n", cfg.ListenAddr, cfg.Port)
-	
 	if cfg.DNSTapPath != "" {
-		fmt.Printf("   🦐 DNSTap Socket   : %s\n", cfg.DNSTapPath)
+		fmt.Printf("   🦐 DNSTap Socket   : %s (mode %04o)\n", cfg.DNSTapPath, cfg.SocketMode)
 	} else {
 		fmt.Printf("   📄 Log File        : %s\n", cfg.LogFilePath)
 	}
@@ -119,66 +68,145 @@ func main() {
 	}
 	defer db.Close()
 
-	// 启动定时清理任务（每小时清理一次过期数据 + 检查数据库大小）
-	go func() {
-		ticker := time.NewTicker(1 * time.Hour)
-		defer ticker.Stop()
-		for {
-			db.CleanupOldRecords(cfg.CacheTTLDays)
-			db.CleanupBySize(int64(cfg.MaxSizeMB))
-			<-ticker.C
-		}
-	}()
+	// Batched writer: one transaction per 64 records / 10ms instead of one
+	// transaction per DNS frame.
+	writer := database.NewWriter(db, cfg.QueueSize, cfg.BatchSize, cfg.FlushMS)
+	defer writer.Close()
+
+	edge := ingestor.NewEdge(writer, cfg, codes)
+	allowed, err := ingestor.ParseMessageTypes(cfg.DNSTapTypes)
+	if err != nil {
+		log.Fatalf("❌ %v", err)
+	}
+	merger := ingestor.NewMerger(8192, 10*time.Second, allowed)
 
 	var parser ingestor.Parser
 	if cfg.DNSTapPath != "" {
-		parser = ingestor.NewDnstapReader(cfg.DNSTapPath)
+		parser = ingestor.NewDnstapReader(cfg.DNSTapPath, cfg, edge, merger)
 	} else {
-		parser = ingestor.NewLogReader(cfg.LogFilePath)
+		parser = ingestor.NewLogReader(cfg.LogFilePath, cfg.LogFromStart, edge)
 	}
+	defer parser.Close()
 
-	// 启动数据摄入，错误直接打印到 stderr
+	// Periodic maintenance: retention, size cap, and merger timeouts.
+	stopMaint := make(chan struct{})
 	go func() {
-		fmt.Println("🔄 正在启动数据摄入...")
-		if err := parser.Start(db); err != nil {
-			fmt.Printf("❌ 数据摄入错误: %v\n", err)
-			log.Fatalf("Ingestor fatal error: %v", err)
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		db.CleanupOldRecords(cfg.CacheTTLDays)
+		db.CleanupBySize(int64(cfg.MaxSizeMB))
+		for {
+			select {
+			case <-stopMaint:
+				return
+			case <-ticker.C:
+				db.CleanupOldRecords(cfg.CacheTTLDays)
+				db.CleanupBySize(int64(cfg.MaxSizeMB))
+			}
+		}
+	}()
+	defer close(stopMaint)
+
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopMaint:
+				return
+			case <-ticker.C:
+				if r, ok := parser.(*ingestor.DnstapReader); ok {
+					r.FlushTimeouts()
+				}
+			}
 		}
 	}()
 
-	handler := api.NewHandler(db, cfg)
-	addr := fmt.Sprintf("%s:%d", cfg.ListenAddr, cfg.Port)
-	server := &http.Server{
-		Addr:    addr,
-		Handler: handler.GetRouter(),
-	}
-
-	idleConnsClosed := make(chan struct{})
+	// Ingestor errors are fatal: the old code printed them but kept serving a
+	// frozen dashboard forever.
+	ingestErr := make(chan error, 1)
 	go func() {
-		sigint := make(chan os.Signal, 1)
-		signal.Notify(sigint, syscall.SIGINT, syscall.SIGTERM)
-		<-sigint
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		server.Shutdown(ctx)
-		close(idleConnsClosed)
+		log.Printf("🔄 启动数据摄入: %s", parser.GetPath())
+		if err := parser.Start(writer); err != nil {
+			ingestErr <- err
+		}
 	}()
 
-	fmt.Printf("✅ Dashboard starting at http://%s\n", addr)
-	// Go 1.24 and later open TCP listeners as MPTCP sockets by default.
-	// CVE-2026-98432 is a kernel use-after-free in the IPv4 TCP request
-	// path, and the only demonstrated remote code execution against it
-	// needs an MPTCP listener. Opting out here keeps this listener plain
-	// TCP, which closes that path. It does not repair the kernel: the
-	// kernel still has to be updated.
+	handler := api.NewHandler(db, cfg, Version)
+	addr := fmt.Sprintf("%s:%d", cfg.ListenAddr, cfg.Port)
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           handler.GetRouter(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
+
+	// Go 1.24+ opens TCP listeners as MPTCP by default. CVE-2026-98432's
+	// demonstrated RCE path needs an MPTCP listener, so opt out explicitly.
+	// (This does not repair the kernel; it still needs updating.)
 	lc := net.ListenConfig{}
 	lc.SetMultipathTCP(false)
 	ln, err := lc.Listen(context.Background(), "tcp", addr)
 	if err != nil {
-		log.Fatalf("Listen error: %v\n", err)
+		log.Fatalf("❌ Listen error: %v", err)
 	}
-	if err := server.Serve(ln); err != http.ErrServerClosed {
-		log.Fatalf("Listen error: %v", err)
+
+	fmt.Printf("✅ Dashboard starting at http://%s\n", addr)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.Serve(ln) }()
+
+	select {
+	case sig := <-shutdown:
+		log.Printf("🛑 收到 %s，正在关闭…", sig)
+	case err := <-ingestErr:
+		log.Printf("❌ 数据摄入致命错误: %v", err)
+	case err := <-serveErr:
+		if err != nil && err != http.ErrServerClosed {
+			log.Printf("❌ HTTP server 错误: %v", err)
+		}
 	}
-	<-idleConnsClosed
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = server.Shutdown(ctx)
+	_ = parser.Close()
+	writer.Close()
+}
+
+func usage() {
+	fmt.Fprintf(os.Stderr, "Unbound Dashboard %s\n", Version)
+	fmt.Fprintf(os.Stderr, "GitHub: https://github.com/LeisureLinux/unbound-dashboard/\n\n")
+	fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "Data source (exactly one required):\n")
+	fmt.Fprintf(os.Stderr, "  -D, --dnstap PATH          DNSTap unix socket path\n")
+	fmt.Fprintf(os.Stderr, "  -l, --log-file PATH        Unbound verbose log file\n\n")
+	fmt.Fprintf(os.Stderr, "HTTP / storage:\n")
+	fmt.Fprintf(os.Stderr, "  -a, --addr ADDR            HTTP listen address (default 127.0.0.1)\n")
+	fmt.Fprintf(os.Stderr, "  -p, --port PORT            HTTP listen port (default 9153)\n")
+	fmt.Fprintf(os.Stderr, "  -d, --data-dir DIR         SQLite directory (default /var/lib/unbound)\n")
+	fmt.Fprintf(os.Stderr, "  -t, --ttl DAYS             Retention days (default 90)\n")
+	fmt.Fprintf(os.Stderr, "  -S, --size MB              Max DB size (default 200)\n\n")
+	fmt.Fprintf(os.Stderr, "Transforms (DNS-collector style):\n")
+	fmt.Fprintf(os.Stderr, "  -i, --ignore-domains LIST  Comma separated domain suffixes to drop\n")
+	fmt.Fprintf(os.Stderr, "  -b, --block-rcodes LIST    Rcodes counted as blocked (default NXDOMAIN,REFUSED; empty = policy only)\n")
+	fmt.Fprintf(os.Stderr, "  -y, --dnstap-types LIST    DNSTap message types (default CLIENT_QUERY,CLIENT_RESPONSE)\n")
+	fmt.Fprintf(os.Stderr, "  -A, --anonymize-ip         Hash client IPs before storage\n")
+	fmt.Fprintf(os.Stderr, "  -r, --log-from-start       Read whole log file at startup (default true)\n\n")
+	fmt.Fprintf(os.Stderr, "DNSTap socket / writer:\n")
+	fmt.Fprintf(os.Stderr, "  -m, --socket-mode OCTAL    Socket permissions (default 0660)\n")
+	fmt.Fprintf(os.Stderr, "  -g, --socket-group GROUP   Socket group (default unbound)\n")
+	fmt.Fprintf(os.Stderr, "  -q, --queue-size N         Ingest queue capacity (default 4096)\n")
+	fmt.Fprintf(os.Stderr, "  -B, --batch-size N         Records per transaction (default 64)\n")
+	fmt.Fprintf(os.Stderr, "  -f, --flush-ms N           Max flush delay in ms (default 10)\n\n")
+	fmt.Fprintf(os.Stderr, "Other:\n")
+	fmt.Fprintf(os.Stderr, "  -P, --debug-public         Allow /debug from non-loopback clients\n")
+	fmt.Fprintf(os.Stderr, "  -k, --debug-token TOKEN    Require a bearer token for /debug\n")
+	fmt.Fprintf(os.Stderr, "  -T, --test-config          Validate configuration and exit\n")
+	fmt.Fprintf(os.Stderr, "  -V, --version              Show version\n")
+	fmt.Fprintf(os.Stderr, "  -h, --help                 Show help\n")
 }

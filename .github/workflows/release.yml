@@ -9,7 +9,11 @@ permissions:
   contents: write
 
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   build-deb:
+    needs: ci
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -53,7 +57,10 @@ jobs:
           CGO_ENABLED: 1
           CC: ${{ matrix.cc }}
         run: |
-          go build -ldflags="-s -w" -o bins/unbound-dashboard ./cmd/
+          # Inject the tag into --version so the shipped binary cannot drift
+          # from the release (the old build hardcoded a const in main.go).
+          go build -ldflags="-s -w -X main.Version=${{ steps.version.outputs.tag }}" \
+            -o bins/unbound-dashboard ./cmd/
           file bins/unbound-dashboard
 
       - name: Build .deb package

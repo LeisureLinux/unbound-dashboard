@@ -13,7 +13,8 @@ Description: Lightweight Unbound DNS real-time visualization dashboard
  .
  Features:
   - DNSTap and verbose-log dual data source modes
-  - REST API: /stats (JSON), /debug (Text)
+  - Query/response correlation, edge filtering and IP anonymization
+  - REST API: /stats, /metrics (Prometheus), /healthz, /debug
   - HTML dashboard with auto-refresh
-  - SQLite storage with automatic data retention
+  - Batched SQLite writes with automatic retention
 Homepage: https://github.com/LeisureLinux/unbound-dashboard

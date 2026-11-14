@@ -1,4 +1,4 @@
-.TH UNBOUND-DASHBOARD 1 "2026-07-31" "unbound-dashboard" "Unbound DNS Dashboard"
+.TH UNBOUND-DASHBOARD 1 "2026-11-14" "unbound-dashboard" "Unbound DNS Dashboard"
 .SH NAME
 unbound-dashboard \- lightweight real-time visualization dashboard for Unbound DNS
 .SH SYNOPSIS
@@ -7,25 +7,41 @@ unbound-dashboard \- lightweight real-time visualization dashboard for Unbound D
 .SH DESCRIPTION
 .B unbound-dashboard
 is a lightweight, single-binary DNS visualization dashboard written in Go
-with SQLite storage. It reads DNS query data from Unbound via DNSTap socket
-or verbose log file, and serves a real-time web dashboard with Top-N query
-and blocked domain statistics.
+with SQLite storage. It reads DNS query data from Unbound via a DNSTap unix
+socket or a verbose log file, and serves a real-time web dashboard with
+Top-N query, blocked/abnormal domain and response-code statistics.
 .PP
-The dashboard listens on port 9153 by default and provides both an HTML
-dashboard and a JSON API endpoint for monitoring integration.
+The dashboard listens on 127.0.0.1:9153 by default. It exposes an HTML
+dashboard, a JSON API, a Prometheus metrics endpoint and a health check.
+.PP
+DNSTap query and response frames are correlated into a single transaction;
+every record is normalized (lowercase, no trailing dot), optionally filtered
+and optionally anonymized before it reaches SQLite. Inserts are batched into
+transactions. Existing v0.2.x databases are migrated automatically.
 .SH DATA SOURCE MODES
-.B unbound-dashboard
-supports two mutually exclusive data source modes. Exactly one must be
-specified at startup.
+Exactly one source must be specified. Use \fB\-\-test\-config\fR to validate
+the configuration without opening the database or creating directories.
 .SS DNSTap mode (recommended)
-Uses the DNSTap Frame Streams protocol over a Unix socket. Requires Unbound
-compiled with \fB\-\-enable\-dnstap\fR. Provides real-time streaming with
-better performance and structured data.
+The dashboard creates and listens on a DNSTap Frame Streams unix socket;
+Unbound connects to it as a client. Requires Unbound built with
+\fB\-\-enable\-dnstap\fR. The socket is created with mode \fB0660\fR and
+group \fBunbound\fR by default, never world-writable.
 .SS Log file mode
-Tails an Unbound verbose log file. Compatible with any Unbound installation
-without extra compile options. Requires \fBverbosity: 2\fR and
-\fBlog-queries: yes\fR in the Unbound configuration.
+Tails an Unbound verbose log file, detecting logrotate by inode change.
+Requires \fBverbosity: 2\fR and \fBlog-queries: yes\fR.
 .SH OPTIONS
+.SS Data source
+.TP
+.BI \-D " \fR,\fP " \-\-dnstap " PATH"
+DNSTap unix socket path. Mutually exclusive with \fB\-l\fR.
+.TP
+.BI \-l " \fR,\fP " \-\-log\-file " PATH"
+Unbound verbose log file path. Mutually exclusive with \fB\-D\fR.
+.TP
+.BI \-r " \fR,\fP " \-\-log\-from\-start " BOOL"
+Read the whole log file at startup. Default: true. Use
+\fB\-\-log\-from\-start=false\fR to tail only new data.
+.SS HTTP and storage
 .TP
 .BI \-a " \fR,\fP " \-\-addr " ADDRESS"
 HTTP listen address. Default: \fB127.0.0.1\fR.
@@ -34,78 +50,123 @@ HTTP listen address. Default: \fB127.0.0.1\fR.
 HTTP listen port. Default: \fB9153\fR.
 .TP
 .BI \-d " \fR,\fP " \-\-data\-dir " DIR"
-Directory for SQLite database storage. Default: \fB/var/lib/unbound\fR.
-.TP
-.BI \-D " \fR,\fP " \-\-dnstap " PATH"
-DNSTap Unix socket path. Mutually exclusive with \fB\-l\fR.
-.TP
-.BI \-l " \fR,\fP " \-\-log\-file " PATH"
-Unbound verbose log file path. Mutually exclusive with \fB\-D\fR.
+SQLite database directory. Default: \fB/var/lib/unbound\fR.
 .TP
 .BI \-t " \fR,\fP " \-\-ttl " DAYS"
-Data retention period in days. The dashboard automatically purges records
-older than this value every hour. Default: \fB90\fR. Maximum: 9999.
+Retention in days, purged hourly. Default: \fB90\fR (1..9999).
 .TP
 .BI \-S " \fR,\fP " \-\-size " MB"
-Maximum database file size in megabytes. When exceeded, the oldest records
-are purged. Default: \fB200\fR. Maximum: 9999.
+Maximum database size in MB. Default: \fB200\fR (1..9999).
+.SS Edge transforms
+.TP
+.BI \-i " \fR,\fP " \-\-ignore\-domains " LIST"
+Comma-separated domain suffixes dropped before storage.
+.TP
+.BI \-b " \fR,\fP " \-\-block\-rcodes " LIST"
+Response codes counted as blocked. Default: \fBNXDOMAIN,REFUSED\fR.
+Set to an empty string to count only explicit RPZ/policy signals.
+NXDOMAIN is a normal negative answer, not inherently a block.
+.TP
+.BI \-y " \fR,\fP " \-\-dnstap\-types " LIST"
+DNSTap message types admitted to the query/response merger. Default:
+\fBCLIENT_QUERY,CLIENT_RESPONSE\fR.
+.TP
+.BI \-A " \fR,\fP " \-\-anonymize\-ip
+Hash client IPs with a per-process random salt before storing them.
+.SS DNSTap socket and batched writer
+.TP
+.BI \-m " \fR,\fP " \-\-socket\-mode " OCTAL"
+Socket permissions. Default: \fB0660\fR.
+.TP
+.BI \-g " \fR,\fP " \-\-socket\-group " GROUP"
+Group to chown the socket to. Default: \fBunbound\fR. Empty disables chown.
+.TP
+.BI \-q " \fR,\fP " \-\-queue\-size " N"
+Ingest queue capacity. Default: \fB4096\fR. Full queue drops frames and
+increments \fBrecords_dropped_total\fR.
+.TP
+.BI \-B " \fR,\fP " \-\-batch\-size " N"
+Records per SQLite transaction. Default: \fB64\fR.
+.TP
+.BI \-f " \fR,\fP " \-\-flush\-ms " N"
+Max delay before flushing a partial batch. Default: \fB10\fR.
+.SS Other
+.TP
+.BI \-P " \fR,\fP " \-\-debug\-public
+Allow /debug from non-loopback clients. Default: off.
+.TP
+.BI \-k " \fR,\fP " \-\-debug\-token " TOKEN"
+Require \fBAuthorization: Bearer TOKEN\fR for /debug.
+.TP
+.BI \-T " \fR,\fP " \-\-test\-config
+Validate configuration and exit with "config OK!".
 .TP
 .B \-V "\fR,\fP " \-\-version
-Print the version string and exit.
+Print the version (injected at build time) and exit.
 .TP
 .B \-h "\fR,\fP " \-\-help
-Print usage information and exit.
+Print usage and exit.
+.PP
+Both \fB\-\-opt value\fR and \fB\-\-opt=value\fR forms are accepted.
 .SH HTTP ENDPOINTS
-Once running, the dashboard exposes three HTTP endpoints:
 .TP
 .B /
-HTML visualization dashboard with Top 10 queries and blocked domains.
-Auto-refreshes every 5 seconds.
+HTML dashboard, auto-refreshes every 5 seconds. All dynamic labels are
+HTML-escaped.
 .TP
 .B /stats
-JSON statistics API. Returns total queries, blocked queries, uptime,
-top queried domains, and top blocked domains. Suitable for monitoring
-and scripting integration.
+JSON statistics: version, total_queries, blocked_queries, uptime, since,
+top_queries, top_blocked and rcode_breakdown.
+.TP
+.B /metrics
+Prometheus text exposition with pipeline counters (frames_received_total,
+frames_malformed_total, records_dropped_total, records_inserted_total, ...).
+.TP
+.B /healthz
+JSON liveness check.
 .TP
 .B /debug
-Plain-text runtime debug information, including data source type,
-connection path, database location, and the last 5 ingested records.
+Plain-text runtime information. Restricted to loopback unless
+\fB\-\-debug\-public\fR or \fB\-\-debug\-token\fR is configured.
 .SH EXAMPLES
-Start with DNSTap socket:
+Validate then start with DNSTap:
 .PP
 .RS
 .nf
-unbound-dashboard \-\-dnstap /var/lib/unbound/dnstap.sock
+unbound-dashboard --test-config --dnstap /var/lib/unbound/dnstap.sock
+unbound-dashboard --dnstap /var/lib/unbound/dnstap.sock
 .fi
 .RE
 .PP
-Start with log file, listen on all interfaces:
+Drop health-check noise and anonymize client IPs:
 .PP
 .RS
 .nf
-unbound-dashboard \-\-log\-file /var/log/unbound.log \-\-addr 0.0.0.0
+unbound-dashboard --dnstap /var/lib/unbound/dnstap.sock \\
+    --ignore-domains arpa,internal --anonymize-ip
 .fi
 .RE
 .PP
-Query the JSON API:
+Strict blocking semantics (only RPZ/policy counts):
 .PP
 .RS
 .nf
-curl \-s http://localhost:9153/stats | jq
+unbound-dashboard --dnstap /var/lib/unbound/dnstap.sock --block-rcodes=
 .fi
 .RE
 .SH SYSTEMD SERVICE
-A systemd unit file is provided for production deployments. After
-installation via the .deb package, enable and start the service:
+After installing the .deb package, edit the unit to set your data source,
+then run:
 .PP
 .RS
 .nf
-systemctl enable \-\-now unbound\-dashboard
+systemctl edit unbound-dashboard
+systemctl enable --now unbound-dashboard
 .fi
 .RE
 .PP
-Edit \fB/etc/systemd/system/unbound\-dashboard.service\fR to configure
-the data source and other options before starting.
+The service does not require root; a dedicated user with write access to
+\fB/var/lib/unbound\fR is sufficient.
 .SH FILES
 .TP
 .I /usr/local/bin/unbound\-dashboard
@@ -120,8 +181,12 @@ Systemd service unit.
 .BR unbound (8),
 .BR unbound.conf (5)
 .PP
+Related project:
+.UR https://github.com/dmachard/DNS-collector
+.UE
+.PP
 GitHub repository:
 .UR https://github.com/LeisureLinux/unbound-dashboard
 .UE
 .SH AUTHORS
-.LeisureLinux
+LeisureLinux

@@ -8,11 +8,13 @@ Wants=unbound.service
 Type=simple
 ExecStart=/usr/local/bin/unbound-dashboard \
     --dnstap /var/lib/unbound/dnstap.sock \
-    --data-dir /var/lib/unbound
+    --data-dir /var/lib/unbound \
+    --socket-group unbound
 Restart=always
 RestartSec=5
-User=root
-Group=root
+# 不再需要 root；专用用户 + /var/lib/unbound 写权限即可
+User=unbound-dashboard
+Group=unbound
 
 # 安全加固
 NoNewPrivileges=yes

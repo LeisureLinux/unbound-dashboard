@@ -1,24 +1,23 @@
 # Unbound DNS Dashboard
 
-轻量级 **[Unbound](https://github.com/NLnetLabs/unbound) DNS 实时可视化看板**，用 Go 编写，SQLite 存储。支持从 Unbound verbose-log 或 [DNSTap](https://dnstap.info/) socket 读取数据，提供 Top10 查询域名 / 拦截域名的仪表盘界面。
+轻量级 **[Unbound](https://github.com/NLnetLabs/unbound) DNS 实时可视化看板**，用 Go 编写，SQLite 存储。单二进制部署，支持从 Unbound 的 [DNSTap](https://dnstap.info/) socket 或 verbose-log 读取数据，提供 Top10 查询域名 / 拦截域名的仪表盘界面。
 
 ```
-端口 : 9153
+端口 : 9153（默认只监听 127.0.0.1）
 前端 : 内嵌 HTML（单文件部署）
-后端 : REST API (JSON) + SQLite
-数据源 : Unbound verbose-log 文件或 DNSTap Unix Socket
+后端 : REST API (JSON) + Prometheus /metrics + SQLite
+数据源 : DNSTap Unix Socket 或 Unbound verbose log
 ```
+
+与 [DNS-collector](https://github.com/dmachard/DNS-collector) 的定位不同：它是通用的 DNS 遥测**管道**（多种 collector → transformer → logger），需要 YAML 配置和外部数据栈；本项目是一个**开箱即用的本地看板**。本项目借鉴了它的边缘处理（normalize / traffic filtering / user privacy）、批处理与 `*_traffic_total` 指标思路，但没有引入 Kafka/ClickHouse/Loki/Grafana 之类的外部依赖。
 
 ---
 
 ## 安装
 
-### 方式一：通过 Freelamp APT 仓库安装（推荐）
-
-添加 APT 源（一次性配置，含 GPG 签名公钥）：
+### 方式一：Freelamp APT 仓库（推荐）
 
 ```bash
-# 添加 APT 源
 curl -fsSL https://repo.freelamp.com/apt.key | sudo gpg --dearmor -o /usr/share/keyrings/freelamp.gpg
 sudo tee /etc/apt/sources.list.d/freelamp.sources >/dev/null <<'EOF'
 Types: deb
@@ -27,79 +26,58 @@ Suites: bookworm
 Components: main
 Signed-By: /usr/share/keyrings/freelamp.gpg
 EOF
-
-# 更新并安装
 sudo apt update
 sudo apt install unbound-dashboard
 ```
 
-安装后，程序位于 `/usr/local/bin/unbound-dashboard`，man 手册和 systemd 服务已就绪。
-
-### 方式二：从源码编译
-
+### 方式二：源码编译
 
 ```bash
-# 1. 克隆
-git clone https://github.com/LeisureLinux/adhole.git
-cd adhole/utils/unbound-dashboard
-
-# 2. 安装依赖
+git clone https://github.com/LeisureLinux/unbound-dashboard.git
+cd unbound-dashboard
 go mod download
+./build.sh                 # 自动生成 amd64 + arm64，版本取自 git tag
 
-# 3. 编译 (本机 amd64)
-CGO_ENABLED=1 go build -ldflags="-s -w" -o bins/unbound-dashboard ./cmd/
-
-# 4. 运行（必须指定数据源）
-./unbound-dashboard --dnstap /var/lib/unbound/dnstap.sock
-# 或
-./unbound-dashboard --log-file /var/log/unbound-debug.log
+# 或手动构建
+CGO_ENABLED=1 go build -ldflags="-s -w -X main.Version=$(git describe --tags --always)" \
+    -o bins/unbound-dashboard ./cmd/
 ```
 
-访问 `http://<server>:9153` 即可看到仪表盘。
+运行前先验证配置：
+
+```bash
+./bins/unbound-dashboard --test-config --dnstap /var/lib/unbound/dnstap.sock
+./bins/unbound-dashboard --dnstap /var/lib/unbound/dnstap.sock
+```
+
+访问 `http://127.0.0.1:9153`。
 
 ---
 
 ## Unbound 配置
 
-### 模式一：DNSTap 模式（推荐）
-
-**优点**：实时流式传输，性能更好，结构化数据
-
-在 `/etc/unbound/unbound.conf` 中添加：
+### 模式一：DNSTap（推荐）
 
 ```yaml
+# /etc/unbound/unbound.conf
 dnstap:
     dnstap-enable: yes
     dnstap-socket-path: "/var/lib/unbound/dnstap.sock"
-    
-    # 客户端流量（下游查询和响应）
     dnstap-log-client-query-messages: yes
     dnstap-log-client-response-messages: yes
-    
-    # 可选：递归迭代流量（出站到权威 DNS）
-    # dnstap-log-resolver-query-messages: yes
-    # dnstap-log-resolver-response-messages: yes
-    
-    # 可选：转发流量（出站到上游转发器）
-    # dnstap-log-forwarder-query-messages: yes
-    # dnstap-log-forwarder-response-messages: yes
 ```
 
-**注意**：
-- Unbound 必须编译时启用 dnstap 支持（`--enable-dnstap`）
-- 检查方法：`unbound -V 2>&1 | grep -i dnstap`
-- Socket 文件由 Unbound 自动创建，dashboard 作为客户端连接
+> Unbound 需启用 `--enable-dnstap`（`unbound -V | grep -i dnstap` 检查）。
+> **dashboard 是服务端**，创建并监听该 socket；Unbound 作为客户端连入。
+> socket 默认权限 `0660`、属组 `unbound`，可用 `-m` / `-g` 调整。
 
-启动 dashboard：
 ```bash
 ./unbound-dashboard --dnstap /var/lib/unbound/dnstap.sock
 ```
 
-### 模式二：日志文件模式
+DNSTap 会为一次查询产生 **query + response 两个帧**，本程序用 LRU 关联器合并成一条记录，并计算真实延迟；默认只接收 `CLIENT_QUERY,CLIENT_RESPONSE`（可用 `--dnstap-types` 打开递归/转发流量）。
 
-**优点**：兼容性好，无需额外编译选项
-
-1. 在 `/etc/unbound/unbound.conf` 中启用 verbose logging：
+### 模式二：verbose log
 
 ```yaml
 server:
@@ -107,10 +85,7 @@ server:
     log-time-ascii: yes
     log-queries: yes
     log-replies: yes
-    log-servfail: yes
 ```
-
-2. 配置 rsyslog 将 unbound 日志输出到独立文件：
 
 ```bash
 # /etc/rsyslog.d/unbound.conf
@@ -118,153 +93,110 @@ server:
 & stop
 ```
 
-3. 重启服务：
-```bash
-sudo systemctl restart rsyslog
-sudo systemctl restart unbound
-```
-
-启动 dashboard：
 ```bash
 ./unbound-dashboard --log-file /var/log/unbound-debug.log
 ```
 
----
-
-## 交叉编译：ARM64 (树莓派 / NanoPC 等)
-
-### 前置条件：安装交叉编译工具链
-
-在 **x86_64 开发机**上执行：
-
-```bash
-sudo apt update
-sudo apt install gcc-aarch64-linux-gnu golang-go -y
-```
-
-确认工具链就绪：
-
-```bash
-which aarch64-linux-gnu-gcc    # 必须输出路径
-aarch64-linux-gnu-gcc --version
-```
-
-### 交叉编译命令
-
-```bash
-cd /path/to/unbound-dashboard
-
-GOOS=linux GOARCH=arm64 \
-CGO_ENABLED=1 \
-CC=aarch64-linux-gnu-gcc \
-CXX=aarch64-linux-gnu-g++ \
-go build -ldflags="-s -w" -o bins/unbound-dashboard-arm64 ./cmd/
-```
-
-编译参数说明：
-- `-ldflags="-s -w"`：strip 调试信息，减小二进制体积（约 12M → 7M）
-
-### 验证产物
-
-```bash
-file bins/unbound-dashboard-arm64
-# 应输出: ELF 64-bit LSB executable, ARM aarch64 ...
-
-scp bins/unbound-dashboard-arm64 user@raspberry-pi:/usr/local/bin/unbound-dashboard
-```
+tailer 会按 inode 检测 logrotate（rename + create），并只推进到最后一个完整换行，不会吞掉半行；历史数据使用日志里的时间戳而不是启动时间。
 
 ---
 
 ## 配置参数
 
-| 短参数 | 长参数 | 默认值 | 说明 |
-|--------|--------|--------|------|
-| `-a` | `--addr` | `127.0.0.1` | HTTP 监听地址 |
-| `-p` | `--port` | `9153` | HTTP 监听端口 |
-| `-d` | `--data-dir` | `/var/lib/unbound` | SQLite 数据库存放目录 |
-| `-D` | `--dnstap` | _(空)_ | DNSTap socket 路径（与 -l 二选一） |
-| `-l` | `--log-file` | _(空)_ | DNS Server Log file path（与 -D 二选一） |
-| `-t` | `--ttl` | `90` | 数据保留天数（数据库存储） |
-| `-S` | `--size` | `200` | 数据库最大大小（MB，最大 9999） |
-| `-V` | `--version` | - | 显示版本号 |
-| `-h` | `--help` | - | 显示帮助信息 |
+| 短 | 长 | 默认 | 说明 |
+|----|----|------|------|
+| `-D` | `--dnstap PATH` | — | DNSTap socket 路径（与 `-l` 二选一） |
+| `-l` | `--log-file PATH` | — | Unbound verbose log（与 `-D` 二选一） |
+| `-a` | `--addr ADDR` | `127.0.0.1` | HTTP 监听地址 |
+| `-p` | `--port PORT` | `9153` | HTTP 监听端口 |
+| `-d` | `--data-dir DIR` | `/var/lib/unbound` | SQLite 目录 |
+| `-t` | `--ttl DAYS` | `90` | 数据保留天数 |
+| `-S` | `--size MB` | `200` | 数据库上限（超过后分批淘汰最旧记录） |
 
-**注意**：
-- 必须指定 `-D/--dnstap` 或 `-l/--log-file` 之一，否则程序会报错退出
-- 短参数（单横杠）和长参数（双横杠）等价，如 `-V` = `--version`
-- 数据默认保留 90 天，可通过 `-t/--ttl` 参数调整
-- 数据库默认最大 200MB，可通过 `-S/--size` 参数调整（最大 9999MB）
-- 程序每小时自动清理过期数据，并检查数据库大小
+**边缘处理（借鉴 DNS-collector 的 transformers）：**
+
+| 短 | 长 | 默认 | 说明 |
+|----|----|------|------|
+| `-i` | `--ignore-domains LIST` | 空 | 逗号分隔的域名后缀，命中即在入库前丢弃（去健康检查噪声） |
+| `-b` | `--block-rcodes LIST` | `NXDOMAIN,REFUSED` | 计入"拦截/异常"的响应码；设为空则只认 RPZ/policy 信号 |
+| `-y` | `--dnstap-types LIST` | `CLIENT_QUERY,CLIENT_RESPONSE` | 允许进入关联器的 DNSTap 消息类型 |
+| `-A` | `--anonymize-ip` | off | 用带随机盐的 SHA256 哈希客户端 IP 后再存储（GDPR） |
+| `-r` | `--log-from-start` | on | 启动时读取整个日志文件；用 `--log-from-start=false` 只跟新数据 |
+
+**DNSTap socket 与写入器：**
+
+| 短 | 长 | 默认 | 说明 |
+|----|----|------|------|
+| `-m` | `--socket-mode OCTAL` | `0660` | socket 权限（不再是 `0777`） |
+| `-g` | `--socket-group NAME` | `unbound` | socket 属组；设为空跳过 chown |
+| `-q` | `--queue-size N` | `4096` | 摄入队列容量，满时丢帧并计入 `records_dropped_total` |
+| `-B` | `--batch-size N` | `64` | 每个 SQLite 事务的记录数 |
+| `-f` | `--flush-ms N` | `10` | 未满批次的最大刷新延迟 |
+
+**其他：**
+
+| 短 | 长 | 说明 |
+|----|----|------|
+| `-P` | `--debug-public` | 允许非 loopback 访问 `/debug`（默认拒绝） |
+| `-k` | `--debug-token TOKEN` | `/debug` 需要 `Authorization: Bearer <token>` |
+| `-T` | `--test-config` | 只校验配置并退出（对应 DNS-collector 的 `-test-config`） |
+| `-V` | `--version` | 显示版本（由 `-ldflags -X main.Version` 注入） |
+| `-h` | `--help` | 帮助 |
+
+短参数与长参数等价，`--addr=0.0.0.0` / `--dnstap=/path` 也都支持。
 
 ---
 
-## API 接口
-
-启动后提供三个 HTTP 端点（端口默认 9153）：
+## API
 
 | 路径 | 格式 | 说明 |
 |------|------|------|
-| `/` | HTML | 可视化仪表盘，5 秒自动刷新 |
-| `/stats` | JSON | 统计数据，适合脚本/监控集成 |
-| `/debug` | Text | 运行时调试信息（数据源、数据库路径、最近 5 条记录） |
+| `/` | HTML | 仪表盘，5 秒刷新；所有域名/Host 均做 HTML 转义 |
+| `/stats` | JSON | 统计数据（小写 JSON 字段） |
+| `/metrics` | text | Prometheus 文本格式，见下表 |
+| `/healthz` | JSON | 存活检查 |
+| `/debug` | text | 数据源、路径、最近 5 条、管道计数器；默认仅 loopback |
 
-### /stats 示例
-
-```bash
-curl -s http://localhost:9153/stats | jq
-```
-
-返回：
+`/stats` 示例：
 
 ```json
 {
+  "version": "v0.3.0",
   "total_queries": 12345,
   "blocked_queries": 678,
   "uptime": "3h25m10s",
-  "top_queries": [
-    {"Name": "example.com", "Value": 523},
-    {"Name": "dns.google", "Value": 412}
-  ],
-  "top_blocked": [
-    {"Name": "ads.tracker.com", "Value": 89},
-    {"Name": "telemetry.evil.com", "Value": 67}
-  ]
+  "since": "2026-11-01 08:12:33",
+  "top_queries": [{"name": "example.com", "value": 523}],
+  "top_blocked": [{"name": "ads.tracker.com", "value": 89}],
+  "rcode_breakdown": [{"name": "NOERROR", "value": 11000}]
 }
 ```
 
-### /debug 示例
-
-```bash
-curl http://localhost:9153/debug
-```
-
-返回纯文本：
+`/metrics` 主要指标（对应 DNS-collector 的 `worker_ingress/egress/discarded_traffic_total`）：
 
 ```
-== Unbound Dashboard Debug Info ==
-
-Data Source Type : DNSTap Socket
-Connection Path  : /var/lib/unbound/dnstap.sock
-Storage Location : /var/lib/unbound/dashboard.db
-
---- Statistics ---
-Total Queries    : 12345
-Blocked Queries  : 678
-
---- Last 5 Records Ingested ---
-  [NOERROR] example.com (A) -> 93.184.216.34
-  [NXDOMAIN] blocked.ads (A) -> NXDOMAIN
+unbound_dashboard_frames_received_total
+unbound_dashboard_frames_parsed_total
+unbound_dashboard_frames_malformed_total
+unbound_dashboard_records_enqueued_total
+unbound_dashboard_records_dropped_total
+unbound_dashboard_records_inserted_total
+unbound_dashboard_records_ignored_total
+unbound_dashboard_insert_errors_total
+unbound_dashboard_batches_flushed_total
+unbound_dashboard_connections_total / disconnects_total / log_rotations_total
 ```
 
-## Systemd 服务（推荐）
+> `records_dropped_total > 0` 说明 SQLite 跟不上，应调大 `--batch-size` /
+> `--queue-size`，或把数据目录放到更快的磁盘上。
 
-### DNSTap 模式
+---
+
+## Systemd
 
 ```ini
-# /etc/systemd/system/unbound-dashboard.service
 [Unit]
 Description=Unbound DNS Dashboard
-Documentation=https://github.com/LeisureLinux/unbound-dashboard/
 After=network.target unbound.service
 Wants=unbound.service
 
@@ -272,13 +204,13 @@ Wants=unbound.service
 Type=simple
 ExecStart=/usr/local/bin/unbound-dashboard \
     --dnstap /var/lib/unbound/dnstap.sock \
-    --data-dir /var/lib/unbound
+    --data-dir /var/lib/unbound \
+    --socket-group unbound
 Restart=always
 RestartSec=5
-User=root
-Group=root
+User=unbound-dashboard
+Group=unbound
 
-# 安全加固
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -289,44 +221,33 @@ PrivateTmp=yes
 WantedBy=multi-user.target
 ```
 
-### 日志文件模式
+> 程序不再需要 `root`。若用专用用户，确保 `/var/lib/unbound` 可写、且
+> socket 目录允许该用户创建 socket；`-g unbound` 让 Unbound 能连入。
 
-```ini
-# /etc/systemd/system/unbound-dashboard.service
-[Unit]
-Description=Unbound DNS Dashboard
-Documentation=https://github.com/LeisureLinux/unbound-dashboard/
-After=network.target unbound.service
+---
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/unbound-dashboard \
-    --log-file /var/log/unbound-debug.log \
-    --data-dir /var/lib/unbound
-Restart=always
-RestartSec=5
-User=root
-Group=root
+## v0.3.0 修复清单
 
-# 安全加固
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/var/lib/unbound
-ReadOnlyPaths=/var/log/unbound-debug.log
-PrivateTmp=yes
+参照 DNS-collector 的工程实践，本版本处理了以下问题：
 
-[Install]
-WantedBy=multi-user.target
-```
-
-### 启用服务
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now unbound-dashboard
-sudo systemctl status unbound-dashboard
-```
+| 问题 | 处理 |
+|------|------|
+| 图表 CSS 写成 `width:50%%`，所有进度条零宽 | 单 `%`，并有回归测试 |
+| 域名 / `Host` 未转义导致存储型 XSS | `html.EscapeString` + 测试 |
+| `UNIQUE(client_ip,domain,qtype,timestamp)` + 整数秒时间戳 → 同一秒重复查询被 `INSERT OR IGNORE` 吞掉 | 去掉 UNIQUE，自动迁移旧库，引入 `count` 权重列 |
+| 每帧一次 `db.Exec`（无事务/无 prepared stmt） | channel + 批量事务写入，带背压计数 |
+| DNSTap 只解析 DNS 报文，丢弃 envelope | 解析 identity / client IP / wire 时间戳 / rcode / answers / EDNS / policy |
+| query 与 response 各算一次查询 | LRU 关联器合并为一条，计算延迟，超时查询也会落库 |
+| 收到 STOP 后 `Start()` 返回 nil，Unbound 重启后看板静默冻结 | 连接 goroutine 化、持续 Accept、摄入错误升级为致命 |
+| `os.Remove(任意路径)` + `0777` socket | 只删真正的陈旧 socket、拨号探测、`0660` + 属组 |
+| 无帧长上限 / 无超时 / 压缩指针死循环 | 64KB 帧上限、握手 5s / 读 30s 超时、最多 32 次指针跳转 |
+| logrotate 后继续读旧 inode、半行被吞、历史用 `time.Now()` | inode 检测 + 重开、只消费完整行、解析日志时间戳 |
+| "blocked" 口径混乱（NXDOMAIN 既算又注释说不算） | `--block-rcodes` 显式策略 + 单独的 `rcode_breakdown` + RPZ policy 信号 |
+| `--addr=1.2.3.4` 静默失效 | 长短参数同时注册，支持 `=` 语法 |
+| 版本号硬编码在源码、tag 与二进制可能不一致 | `-ldflags -X main.Version`，release workflow 注入 tag |
+| 无测试、无 CI、gofmt 不干净 | 7 个包的单测（含端到端 fstrm 测试）+ `ci.yml`（gofmt/vet/race/coverage/govulncheck），release 依赖 CI |
+| `/debug` 无鉴权且暴露路径与最近域名 | 默认仅 loopback，可选 bearer token |
+| README 指向旧仓库 `adhole/utils/...`、缺 LICENSE | 修正并补齐 |
 
 ---
 
@@ -334,33 +255,27 @@ sudo systemctl status unbound-dashboard
 
 ```
 unbound-dashboard/
-├── cmd/main.go          # 入口：启动 HTTP server + ingestor goroutine
-├── core/types.go        # Config / QueryRecord 类型定义
-├── database/
-│   └── database.go      # SQLite CRUD + Top-N 聚合查询
-├── api/
-│   └── handlers.go      # HTTP handler：/stats, /debug, / (HTML dashboard)
+├── cmd/main.go                     # 入口：配置校验、启动 HTTP + ingestor + writer
+├── core/
+│   ├── types.go                    # Config / QueryRecord / 参数校验
+│   └── helpers.go                  # normalize / filter / privacy / 指标 / Sink
+├── database/database.go            # SQLite 迁移 + 批量事务写入 + 聚合查询
+├── api/handlers.go                 # / /stats /metrics /healthz /debug
 ├── ingestor/
-│   ├── base.go          # Parser 接口 + LogReader 实现
-│   └── dnstap.go        # DNSTap Frame Streams 协议实现
-└── build.sh             # 自动版本号 + 交叉编译脚本
+│   ├── edge.go                     # 入库前的 normalize → filter → privacy
+│   ├── merger.go                   # query/response LRU 关联器
+│   ├── dnstap.go                   # fstrm 服务端（并发、超时、帧长上限）
+│   ├── dnstap_decode.go            # dnstap.Dnstap protobuf 解码
+│   ├── base.go                     # inode 感知的日志 tailer
+│   ├── protobuf/                   # 零依赖、带边界检查的 protobuf 子集
+│   └── dnspacket/                  # 带边界检查的 DNS 报文解析
+├── build.sh                        # amd64 + arm64，版本来自 git tag
+├── packaging/                      # .deb / systemd / maintainer scripts
+└── .github/workflows/{ci,release}.yml
 ```
-
----
-
-## 版本历史
-
-- **v0.2.33** 拦截数显示百分比，默认数据目录改为 /var/lib/unbound
-- **v0.2.31** 无参数启动报错退出，--help 显示 GitHub 地址
-- **v0.2.30** 添加 --version 参数，--help 自定义帮助信息
-- **v0.2.29** 界面右上角添加 GitHub/B站/Twitter 图标，去掉时钟
-- **v0.2.28** 清理调试日志，优化 Frame Streams 双向握手
-- **v0.2.20** 实现 DNSTap Frame Streams 协议，支持 protobuf 解析
-- **v0.2** 修复拦截图表为空问题，拦截/查询图表位置互换
-- **v0.1** 添加去重机制，修复 ingestor 循环语法错误
 
 ---
 
 ## License
 
-MIT
+MIT — 见 [LICENSE](LICENSE)。
